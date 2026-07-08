@@ -4,15 +4,18 @@ apk-scanner.py — Scan APKs for hardcoded secrets, API keys, and sensitive stri
 
 Handles: .apk  .xapk (APKPure bundle)  .aab (Android App Bundle)
 
+Designed to run automatically after apk-hunter.py, or standalone.
+
 Usage:
-  apk-scanner.py /path/to/apks/         # scan all APKs in a directory
-  apk-scanner.py single.apk             # scan one file
-  apk-scanner.py target/ --json         # output full JSON
-  apk-scanner.py target/ --min-severity HIGH
+  apk-scanner.py hunts/2026-07-01-fitness-apps/    # scan all files in a hunt session
+  apk-scanner.py /path/to/apks/                     # scan all files in a directory
+  apk-scanner.py single.apk                         # scan one file
+  apk-scanner.py hunts/2026-07-01-fitness-apps/ --json --min-severity HIGH
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +41,7 @@ class SecretPattern:
 PATTERNS = [
     SecretPattern("aws_access_key",      r"AKIA[0-9A-Z]{16}",                                          "CRITICAL", "AWS IAM Access Key",           case_sensitive=True),
     SecretPattern("aws_sts_token",       r"ASIA[0-9A-Z]{16}",                                          "CRITICAL", "AWS STS Session Token",         case_sensitive=True),
-    SecretPattern("google_api_key",      r"AIzaSy[0-9A-Za-z_\-]{33}",                                  "HIGH",     "Google / Firebase API Key",     case_sensitive=True),
+    SecretPattern("google_api_key",      r"AIzaSy[0-9A-Za-z_\-]{20,}",                                 "HIGH",     "Google / Firebase API Key",     case_sensitive=True),
     SecretPattern("firebase_db_url",     r"https://[a-z0-9\-]+\.firebaseio\.com",                       "MEDIUM",   "Firebase Realtime DB URL"),
     SecretPattern("gcp_service_account", r'"type"\s*:\s*"service_account"',                             "HIGH",     "GCP Service Account JSON"),
     SecretPattern("stripe_live_pub",     r"pk_live_[0-9a-zA-Z]{20,}",                                  "CRITICAL", "Stripe Live Publishable Key",   case_sensitive=True),
@@ -67,6 +71,8 @@ PATTERNS = [
     SecretPattern("hardcoded_password",  r'(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\'\n\r]{6,})["\']',  "MEDIUM",   "Hardcoded Password"),
     SecretPattern("hardcoded_secret",    r'(?:secret|api_key|apikey|api-key|token)\s*[=:]\s*["\']([^"\'\n\r]{8,})["\']', "MEDIUM", "Hardcoded Secret / Token"),
     SecretPattern("hardcoded_auth",      r'(?:auth_token|access_token|client_secret)\s*[=:]\s*["\']([^"\'\n\r]{8,})["\']', "HIGH", "Hardcoded Auth Token"),
+    # Generic live/prod/test API key pattern — catches custom SDK keys (fc_live_, fsk_live_, etc.)
+    SecretPattern("generic_live_key",    r"[a-z][a-z0-9]{1,8}_(?:live|prod|production)_[A-Za-z0-9_\-]{20,}", "HIGH", "Generic Live API Key", case_sensitive=True),
 ]
 
 def _compile(p):
@@ -165,6 +171,129 @@ def extract_dex_strings(dex_bytes):
     return "\n".join(re.findall(r'[ -~]{8,}', content))
 
 
+# ---------------------------------------------------------------------------
+# Entropy-based secret detection
+# ---------------------------------------------------------------------------
+
+def _shannon_entropy(s):
+    if not s:
+        return 0.0
+    freq = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+# Strings that look high-entropy but are always safe to ignore
+_ENTROPY_SKIP = re.compile(
+    r'^[0-9a-f]{32,}$'                               # pure lowercase hex (SHA/MD5 hashes)
+    r'|^[0-9A-F]{32,}$'                               # pure uppercase hex
+    r'|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'              # UUID
+    r'|^https?://'                                    # URLs
+    r'|^\d+\.\d+\.\d+'                                # version strings (1.2.3)
+    r'|^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$'    # package names (com.example.foo)
+    r'|^[A-Za-z0-9+/]{60,}={0,2}$'                   # long base64 blobs
+    r'|^[A-Za-z0-9\-_]{60,}$'                         # long base64url blobs (no padding)
+    r'|^(SSL|TLS)_'                                   # TLS/SSL cipher suite constant names
+    r'|^Base_[Vv][0-9]+'                              # versioned base themes (Base_V14_...)
+    r'|_(Material3?|AppCompat|MaterialComponents'     # Android resource/style name segments
+    r'|ThemeOverlay|Widget|TextAppearance|Animation'
+    r'|ShapeAppearance|BottomSheet|SideSheet'
+    r'|Toolbar|NavBar|M3_Comp|M3_Sys|_M3_)_',
+    re.IGNORECASE,
+)
+
+# SQL query fragments from embedded Room/SQLite schemas — very high entropy but not secrets
+_SQL_KEYWORDS = re.compile(
+    r'\b(SELECT|INSERT|UPDATE|DELETE|CREATE|TABLE|FROM|WHERE|PRIMARY|FOREIGN'
+    r'|REFERENCES|CASCADE|IGNORE|INDEX|NOT NULL|LIMIT|ORDER BY|GROUP BY)\b',
+    re.IGNORECASE,
+)
+
+def _is_secret_shaped(s):
+    """True if string looks like a token/key rather than code or text."""
+    # Secrets don't have spaces
+    if ' ' in s:
+        return False
+    # Source file names embedded in DEX debug info
+    if s.endswith(('.java', '.kt', '.class')):
+        return False
+    # '$' → R8/Kotlin synthetic names  '/' → Dalvik type descriptors / paths
+    # ';' → descriptor terminators  '<' '>' → generic type syntax
+    if any(c in s for c in ('$', '/', ';', '<', '>', '(', ')', '@', '=')):
+        return False
+    # Secrets are mostly alphanumeric (allow _ and -)
+    alnum = sum(1 for c in s if c.isalnum() or c in '_-')
+    if alnum / len(s) < 0.90:
+        return False
+    # Skip internal/private prefixes and Kotlin double-hyphen mangled names
+    if s.startswith('__') or '--' in s:
+        return False
+    # Require separator characters. Real keys have structured prefixes (fc_live_, sk_test_...).
+    # For shorter strings (< 40 chars), require 2+ separators to filter Kotlin mangled
+    # function names (reduceRight-D40WMg8) and Android compat helpers (Helper_API24).
+    # For longer strings, one separator is enough.
+    n_sep = s.count('_') + s.count('-')
+    if n_sep == 0:
+        return False
+    if len(s) < 40 and n_sep < 2:
+        return False
+    # Require all three character classes: upper + lower + digit
+    # (eliminates pure-hex, pure-lowercase identifiers, all-caps constants)
+    has_upper  = bool(re.search(r'[A-Z]', s))
+    has_lower  = bool(re.search(r'[a-z]', s))
+    has_digit  = bool(re.search(r'[0-9]', s))
+    return has_upper and has_lower and has_digit
+
+
+def scan_entropy(strings_block, source_file, seen_global):
+    """
+    Scan a block of newline-separated strings for high-entropy token candidates.
+    Targets strings that look like API keys/tokens regardless of their variable name.
+    Returns Finding objects at MEDIUM severity.
+    """
+    findings = []
+    for raw in strings_block.splitlines():
+        # Strip DEX ULEB128 length bytes that land in printable ASCII range.
+        # Values 0x20-0x2F = punctuation, 0x30-0x39 = digits ('0'-'9'),
+        # 0x3A-0x40 = more punctuation — all appear as leading junk before the string.
+        s = raw.lstrip('!"#$%&\'()*+,-./' + '0123456789' + ':;<=>?@').strip()
+
+        # Length band: shorter strings are probably not tokens; longer are likely blobs
+        if len(s) < 24 or len(s) > 120:
+            continue
+        if _ENTROPY_SKIP.search(s):
+            continue
+        if _SQL_KEYWORDS.search(s):
+            continue
+        if not _is_secret_shaped(s):
+            continue
+
+        e = _shannon_entropy(s)
+        # 4.0 bits/char: comfortably above natural language (~3.2) and identifiers,
+        # but below the base64 alphabet ceiling (~6.0). Real API keys land at 4.0–5.5.
+        if e < 4.0:
+            continue
+
+        # Don't double-report strings already caught by a vendor pattern
+        if any(pat.search(s) for _, pat in COMPILED):
+            continue
+
+        k = ("entropy_secret", s[:80])
+        if k in seen_global:
+            continue
+        seen_global.add(k)
+
+        findings.append(Finding(
+            pattern_name="entropy_secret",
+            severity="MEDIUM",
+            description=f"High-entropy string (entropy={e:.2f} bits/char) — verify manually",
+            value=s[:150],
+            file=source_file,
+            context=s[:220],
+            source="entropy",
+        ))
+    return findings
+
+
 def run_apkleaks(apk_path, tmp_dir):
     """Run apkleaks if installed; return a short summary string."""
     out_file = os.path.join(tmp_dir, "apkleaks_out.json")
@@ -239,7 +368,7 @@ def _scan_zip_contents(zip_path, path_prefix, seen_global, dex_prefix=None):
                 dex_names = [m.filename for m in members
                              if m.filename.startswith(dex_prefix) and m.filename.endswith(".dex")]
 
-            for dex_name in dex_names[:6]:
+            for dex_name in dex_names:
                 try:
                     dex_bytes = zf.read(dex_name)
                     dex_strings = extract_dex_strings(dex_bytes)
@@ -249,6 +378,8 @@ def _scan_zip_contents(zip_path, path_prefix, seen_global, dex_prefix=None):
                         if k not in seen_global:
                             seen_global.add(k)
                             all_findings.append(f)
+                    for f in scan_entropy(dex_strings, label, seen_global):
+                        all_findings.append(f)
                     stats["dex_files"] += 1
                 except Exception:
                     continue
@@ -351,7 +482,7 @@ def scan_aab_file(aab_path, use_apkleaks, min_rank, seen_global, tmp):
             feature_dex = [m.filename for m in zf.infolist()
                            if re.match(r"[^/]+/dex/classes.*\.dex$", m.filename)
                            and not m.filename.startswith("base/")]
-            for dex_name in feature_dex[:4]:
+            for dex_name in feature_dex:
                 try:
                     dex_bytes = zf.read(dex_name)
                     dex_strings = extract_dex_strings(dex_bytes)
@@ -361,6 +492,8 @@ def scan_aab_file(aab_path, use_apkleaks, min_rank, seen_global, tmp):
                         if k not in seen_global:
                             seen_global.add(k)
                             findings.append(f)
+                    for f in scan_entropy(dex_strings, label, seen_global):
+                        findings.append(f)
                     stats["dex_files"] += 1
                 except Exception:
                     continue
