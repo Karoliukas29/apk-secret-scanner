@@ -1131,14 +1131,22 @@ def main():
     print(f"[+] Output dir  → {out_dir}")
 
     verdicts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "CLEAN": 0}
+    finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
     for r in results:
         verdicts[r.verdict] = verdicts.get(r.verdict, 0) + 1
+        for f in r.findings:
+            finding_counts[f.severity] = finding_counts.get(f.severity, 0) + 1
 
+    total_findings = sum(finding_counts.values())
     print(f"\n{'='*64}")
-    print(f"  🔴 CRITICAL : {verdicts['CRITICAL']}")
-    print(f"  🟠 HIGH     : {verdicts['HIGH']}")
-    print(f"  🟡 MEDIUM   : {verdicts['MEDIUM']}")
+    print(f"  {'Files':<10} {'Findings'}")
+    print(f"  {'-'*30}")
+    print(f"  🔴 CRITICAL : {verdicts['CRITICAL']:<6}  {finding_counts['CRITICAL']} findings")
+    print(f"  🟠 HIGH     : {verdicts['HIGH']:<6}  {finding_counts['HIGH']} findings")
+    print(f"  🟡 MEDIUM   : {verdicts['MEDIUM']:<6}  {finding_counts['MEDIUM']} findings")
     print(f"  🟢 CLEAN    : {verdicts['CLEAN']}")
+    print(f"  {'-'*30}")
+    print(f"  Total findings : {total_findings}")
     print(f"{'='*64}\n")
 
     return 0 if (verdicts["CRITICAL"] + verdicts["HIGH"]) == 0 else 1
